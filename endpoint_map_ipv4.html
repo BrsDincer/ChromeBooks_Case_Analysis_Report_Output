@@ -1,0 +1,4273 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, minimum-scale=1.0, maximum-scale=1.0">
+<title>Wireshark: IP Location Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.4.0/dist/leaflet.css"
+    integrity="sha512-puBpdR0798OZvTTbP4A8Ix/l+A4dHDD0DGqYW6RQ+9jxkRFclaxxQb/SJAWZfWAkuyeQUytO7+7N4QKrDh+drA=="
+    crossorigin="">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css"
+    integrity="sha512-BBToHPBStgMiw0lD4AtkRIZmdndhB6aQbXpX7omcrXeG2PauGBl2lzq2xUZTxaLxYz5IDHlmneCZ1IJ+P3kYtQ=="
+    crossorigin="">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css"
+    integrity="sha512-RLEjtaFGdC4iQMJDbMzim/dOvAu+8Qp9sw7QE4wIMYcg2goVoivzwgSZq9CsIxp4xKAZPKh5J2f2lOko2Ze6FQ=="
+    crossorigin="">
+<!--
+<link rel="stylesheet" href="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.css"
+    integrity="sha512-wgiKVjb46JxgnGNL6xagIy2+vpqLQmmHH7fWD/BnPzouddSmbRTf6xatWIRbH2Rgr2F+tLtCZKbxnhm5Xz0BcA=="
+    crossorigin="">
+-->
+<style>
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+}
+#map {
+    height: 100%;
+}
+.file-picker-enabled #map, #file-picker-container {
+    display: none;
+}
+.file-picker-enabled #file-picker-container {
+    display: block;
+    margin: 2em;
+}
+.range-control {
+    padding: 3px 5px;
+    color: #333;
+    background: #fff;
+    opacity: .5;
+}
+.range-control:hover { opacity: 1; }
+.range-control-label { padding-right: 3px; }
+.range-control-input { padding: 0; width: 130px; }
+.range-control-input, .range-control-label { vertical-align: middle; }
+</style>
+<script src="https://unpkg.com/leaflet@1.4.0/dist/leaflet.js"
+    integrity="sha512-QVftwZFqvtRNi0ZyCtsznlKSWOStnDORoefr1enyq5mVL4tmKB3S/EnC3rRJcxCPavG10IcrVGSmPh6Qw5lwrg=="
+    crossorigin=""></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"
+    integrity="sha512-MQlyPV+ol2lp4KodaU/Xmrn+txc1TP15pOBF/2Sfre7MRsA/pB4Vy58bEqe9u7a7DczMLtU5wT8n7OblJepKbg=="
+    crossorigin=""></script>
+<!--
+<script src="https://unpkg.com/leaflet-measure@3.1.0/dist/leaflet-measure.js"
+    integrity="sha512-ovh6EqS7MUI3QjLWBM7CY8Gu8cSM5x6vQofUMwKGbHVDPSAS2lmNv6Wq5es5WCz1muyojQxcc8rA3CvVjD2Z+A=="
+    crossorigin=""></script>
+-->
+<script>
+var map;
+
+function sortIpKey(v) {
+    if (/\./.test(v)) {
+        // Assume IPv4. Convert 192.0.2.34 -> 192.000.002.034 for alpha sort.
+        return v.replace(/\b\d\b/g, '00$&').replace(/\b\d{2}\b/g, '0$&');
+    } else {
+        // Assume IPv6. We won't handle :: correctly. Hope for the best.
+        return v;
+    }
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function sanitizeHtml(text) {
+    // Handle legacy data containing <div class="geoip_property">...</div>
+    // (since Wireshark 2.0) or <br/> (before v1.99.0-rc1-1781-g7e63805708).
+    text = text
+        .replace(/<div[^>]*>/g, '')
+        .replace(/<\/div>|<br\/>/g, '\n')
+        .replace(/&#39;/g, "'");
+    return escapeHtml(text).replace(/\n/g, '<br>');
+}
+
+var RangeControl = L.Control.extend({
+    options: {
+        // @option label: String = 'Speed:'
+        // The HTML text to be displayed next to the slider.
+        label: '',
+        title: '',
+
+        min: 0,
+        max: 100,
+        value: 0,
+
+        // @option onChange: Function = *
+        // A `Function` that is called on slider value changes.
+        // Called with two arguments, the new and previous range value.
+    },
+    onAdd: function(map) {
+        var className = 'range-control';
+        var container = L.DomUtil.create('div', className + ' leaflet-bar');
+        L.DomEvent.disableClickPropagation(container);
+        var label = L.DomUtil.create('label', className + '-label', container);
+        var labelText = L.DomUtil.create('span', className + '-label', label);
+        labelText.title = this.options.title;
+        labelText.innerHTML = this.options.label;
+        var input = L.DomUtil.create('input', className + '-input', label);
+        this._input = input;
+        input.type = 'range';
+        input.min = this.options.min;
+        input.max = this.options.max;
+        this._lastValue = input.valueAsNumber = this.options.value;
+        L.DomEvent.on(input, 'change', this._onInputChange, this);
+        return container;
+    },
+    _onInputChange: function(ev) {
+        var value = this._input.valueAsNumber;
+        if (value !== this._lastValue) {
+            if (this.options.onChange) {
+                this.options.onChange(value, this._lastValue);
+            }
+            this._lastValue = value;
+        }
+    }
+});
+
+var rangeControl = function(options) {
+    return new RangeControl(options);
+};
+
+function loadGeoJSON(obj) {
+    'use strict';
+    if (map) map.remove();
+    map = L.map('map');
+    var tileServer = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+    L.tileLayer(tileServer, {
+        minZoom: 2,
+        maxZoom: 16,
+        subdomains: 'abcd',
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+    }).addTo(map);
+    L.control.scale().addTo(map);
+
+    // Measurement tool, useful for investigating accuracy-related issues.
+    if (L.control.measure) {
+        L.control.measure({
+            primaryLengthUnit: 'kilometers',
+            secondaryLengthUnit: 'miles'
+        }).addTo(map);
+    }
+
+    var geoJson = L.geoJSON(obj, {
+        pointToLayer: function(feature, latlng) {
+            // MaxMind databases use km for accuracy, but they always use
+            // 50, 100, 200 or 1000. That is too course, so ignore it and use a
+            // fixed 1km radius.
+            // See https://gitlab.com/wireshark/wireshark/-/issues/14693#note_400735005
+            return L.circle(latlng, {radius: 1e3});
+        },
+        onEachFeature: function(feature, layer) {
+            var props = feature.properties;
+            var title, lines = [];
+            if (props.title && props.description) {
+                title = escapeHtml(props.title);
+                lines.push(sanitizeHtml(props.description));
+            } else {
+                title = escapeHtml(props.ip);
+                if (props.autonomous_system_number) {
+                    var line = 'AS: ' + props.autonomous_system_number;
+                    line += ' (' + props.autonomous_system_organization + ')';
+                    lines.push(escapeHtml(line));
+                }
+                if (props.city) {
+                    lines.push(escapeHtml('City: ' + props.city));
+                }
+                if (props.country) {
+                    lines.push(escapeHtml('Country: ' + props.country));
+                }
+                if ('packets' in props) {
+                    lines.push(escapeHtml('Packets: ' + props.packets));
+                }
+                if ('bytes' in props) {
+                    lines.push(escapeHtml('Bytes: ' + props.bytes));
+                }
+            }
+            if (title) {
+                layer.bindTooltip(title, {
+                    offset: [10, 0],
+                    direction: 'right',
+                    sticky: true
+                });
+            }
+            if (title && lines.length) {
+                layer.bindPopup('<b>' + title + '</b><br>' + lines.join('<br>'));
+            }
+        }
+    });
+
+    map.on('zoomend', function() {
+        // Ensure that the circles are clearly visible even when zoomed out.
+        // Larger values will increase the size of the circle.
+        var visibleZoomLevel = 9;
+        var radius = 1e3;
+        if (map.getZoom() < visibleZoomLevel) {
+            // Enlarge radius to ensure it is easy to select.
+            radius *= map.getZoomScale(visibleZoomLevel, map.getZoom());
+        }
+        geoJson.eachLayer(function(layer) {
+            layer.setRadius(radius);
+        });
+    });
+
+    // Cluster nearby/overlapping nodes by default.
+    var clusterGroup = L.markerClusterGroup({
+        zoomToBoundsOnClick: false,
+        spiderfyOnMaxZoom: false,
+        maxClusterRadius: 10
+    });
+    clusterGroup.addTo(map).addLayer(geoJson);
+    map.fitWorld().fitBounds(clusterGroup.getBounds());
+
+    // Summarize nodes within the cluster.
+    clusterGroup.on('clustermouseover', function(ev) {
+        // More addresses will be stripped.
+        var cutoff = 30;
+        var cluster = ev.propagatedFrom;
+        var addresses = cluster.getAllChildMarkers().map(function(marker) {
+            return marker.getTooltip().getContent();
+        });
+        addresses.sort(function(a, b) {
+            a = sortIpKey(a);
+            b = sortIpKey(b);
+            return a === b ? 0 : (a < b ? -1 : 1);
+        });
+        var deleted = addresses.splice(cutoff).length;
+        var title = addresses.join('<br>');
+        if (deleted) {
+            title += '<br>(and ' + deleted + ' more)';
+        }
+        cluster.bindTooltip(title, {
+            offset: [10, 0],
+            direction: 'right',
+            sticky: true,
+            opacity: 0.8
+        }).openTooltip();
+    }).on('clustermouseout', function(ev) {
+        ev.propagatedFrom.unbindTooltip();
+    }).on('clusterclick', function(ev) {
+        ev.propagatedFrom.spiderfy();
+    });
+
+    // Provide an option to disable clustering
+    rangeControl({
+        label: 'Cluster radius:',
+        title: 'Control merging of nearby nodes. Set to the minimum to disable merges.',
+        min: 0,
+        max: 100,
+        value: clusterGroup.options.maxClusterRadius,
+        onChange: function(value, oldValue) {
+            // Apply new radius: remove map, clear markers and finally add new.
+            clusterGroup.options.maxClusterRadius = value;
+            clusterGroup.remove().clearLayers().addTo(map);
+            // Value 0: clustering is disabled, the map is directly used.
+            geoJson.remove().addTo(value === 0 ? map : clusterGroup);
+        }
+    }).addTo(map);
+}
+
+function showError(msg) {
+    document.getElementById('error-message').textContent = msg;
+    document.body.classList.add('file-picker-enabled');
+}
+
+function loadData(data) {
+    'use strict';
+    var html_match, what, error;
+    var reOldHtml = /^ *var endpoints = (\{[\s\S]+? *\});$/m;
+    // Complicated regex to support html-minifier.
+    var reNewHtml = /<script[^>]+id="?ipmap-data"?(?: [^>]*)?>\s*(\{[\S\s]+?\})\s*<\/script>/;
+    if ((html_match = reNewHtml.exec(data))) {
+        // Match new ipmap.html file.
+        what = 'new ipmap.html';
+        data = html_match[1];
+    } else if ((html_match = reOldHtml.exec(data))) {
+        // Match old ipmap.html file
+        what = 'old ipmap.html';
+        var text = html_match[1].replace(/'/g, '"');
+        text = text.replace(/ class="geoip_property"/g, '');
+        data = text.replace(/\/\/ Start endpoint list.*/, '');
+    } else if (/^\s*\{[\s\S]+\}\s*$/.test(data)) {
+        // Assume GeoJSON (.json) file.
+        what = 'GeoJSON file';
+    } else {
+        what = 'unknown file';
+        error = 'Unrecognized file contents';
+    }
+    if (!error) {
+        try {
+            loadGeoJSON(JSON.parse(data));
+            return true;
+        } catch (e) {
+            error = e;
+        }
+    }
+    var msg = 'Failed to load map data from ' + what + ': ' + error;
+    msg += '; data was: ' + data.substring(0, 120);
+    if (data.length > 100) msg += '... (' + data.length + ' bytes)';
+    showError(msg);
+}
+
+(function() {
+    'use strict';
+    function loadFromUrl(url) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.onload = function() {
+            if (xhr.status !== 200) {
+                showError('Failed to retrieve ' + url + ': ' + xhr.status + ' ' + xhr.statusText);
+                return;
+            }
+            loadData(xhr.responseText);
+        };
+        xhr.onerror = function() {
+            showError('Failed to retrieve ' + url + ': ' + xhr.status + ' ' + xhr.statusText);
+        };
+        xhr.send(null);
+    }
+
+    addEventListener('load', function() {
+        // Note: FileReader and classList do not work with IE9 or older.
+        var fileSelector = document.getElementById('file-picker');
+        fileSelector.addEventListener('change', function() {
+            if (!fileSelector.files.length) {
+                return;
+            }
+            document.body.classList.remove('file-picker-enabled');
+            var reader = new FileReader();
+            reader.onload = function() {
+                if (!loadData(reader.result)) {
+                    document.body.classList.add('file-picker-enabled');
+                }
+            };
+            reader.onerror = function() {
+                showError('Failed to read file.');
+            };
+            reader.readAsText(fileSelector.files[0]);
+        });
+
+        // Force file picker when the "file" URL is given.
+        var url = location.search.match(/[?&]url=([^&]*)/);
+        if (url) {
+            url = decodeURIComponent(url[1]);
+            if (url) {
+                loadFromUrl(url);
+            } else {
+                showError('');
+            }
+            return;
+        }
+
+        var data = document.getElementById('ipmap-data');
+        if (data) {
+            loadData(data.textContent);
+        } else {
+            showError('');
+        }
+    });
+}());
+</script>
+<div id="file-picker-container">
+<label>Select an ipmap.html or GeoJSON .json file as created by Wireshark.<br>
+<input type="file" id="file-picker" accept=".json,.html"></label>
+<p id="error-message"></p>
+</div>
+<div id="map"></div>
+<!--
+    Wireshark will append a script tag (id="ipmap-data" type="application/json")
+    below, containing a GeoJSON object. If missing, then a file picker will be
+    displayed which can be useful during development.
+-->
+<script id="ipmap-data" type="application/json">
+{
+    "features": [
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "5 MB",
+                "country": "United States",
+                "ip": "172.217.19.68",
+                "packets": "6,225",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "3 MB",
+                "country": "United States",
+                "ip": "216.58.213.227",
+                "packets": "5,050",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "937 kB",
+                "country": "United States",
+                "ip": "172.217.19.74",
+                "packets": "2,127",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "210 kB",
+                "country": "United States",
+                "ip": "172.217.16.67",
+                "packets": "745",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "203 kB",
+                "country": "United States",
+                "ip": "142.251.9.188",
+                "packets": "1,237",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "55 kB",
+                "country": "United States",
+                "ip": "172.217.19.75",
+                "packets": "163",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "172.217.16.78",
+                "packets": "2,408",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "255 kB",
+                "country": "United States",
+                "ip": "216.58.213.202",
+                "packets": "977",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "465 kB",
+                "country": "United States",
+                "ip": "216.58.213.234",
+                "packets": "667",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "7 kB",
+                "country": "United States",
+                "ip": "142.250.181.194",
+                "packets": "21",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "172.217.16.74",
+                "packets": "2,902",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "142.251.9.189",
+                "packets": "15,518",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "45 kB",
+                "country": "United States",
+                "ip": "172.217.19.67",
+                "packets": "198",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "142.250.181.202",
+                "packets": "3,122",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "77 MB",
+                "country": "United States",
+                "ip": "142.250.181.206",
+                "packets": "89,287",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "216.58.213.195",
+                "packets": "2,038",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "25 MB",
+                "country": "United States",
+                "ip": "172.217.19.65",
+                "packets": "22,114",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "172.217.19.78",
+                "packets": "4,674",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "4 MB",
+                "country": "United States",
+                "ip": "216.58.213.238",
+                "packets": "10,044",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "142.250.181.195",
+                "packets": "3,165",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -118.244,
+                    34.0544
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "15 kB",
+                "country": "United States",
+                "ip": "216.239.32.55",
+                "packets": "72",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "28 kB",
+                "country": "United States",
+                "ip": "172.217.19.77",
+                "packets": "58",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "31 kB",
+                "country": "United States",
+                "ip": "172.217.16.80",
+                "packets": "90",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "187 kB",
+                "country": "United States",
+                "ip": "216.58.213.237",
+                "packets": "322",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "11 kB",
+                "country": "United States",
+                "ip": "172.217.19.66",
+                "packets": "20",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "332 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "34.253.40.149",
+                "packets": "507",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3240,
+                "autonomous_system_organization": "Styrelsen for it og laering",
+                "bytes": "1 MB",
+                "country": "Denmark",
+                "ip": "195.231.240.211",
+                "packets": "1,029",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "bytes": "16 kB",
+                "country": "United States",
+                "ip": "151.139.128.14",
+                "packets": "100",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    4.8975,
+                    52.3759
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "538 kB",
+                "city": "Amsterdam",
+                "country": "The Netherlands",
+                "ip": "20.190.160.3",
+                "packets": "332",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "442 kB",
+                "country": "United States",
+                "ip": "52.239.213.4",
+                "packets": "650",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15133,
+                "autonomous_system_organization": "EDGECAST",
+                "bytes": "74 kB",
+                "country": "United States",
+                "ip": "152.199.19.160",
+                "packets": "182",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "493 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "20.190.159.131",
+                "packets": "289",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "6 kB",
+                "country": "United States",
+                "ip": "13.107.213.19",
+                "packets": "20",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15133,
+                "autonomous_system_organization": "EDGECAST",
+                "bytes": "44 kB",
+                "country": "United States",
+                "ip": "152.199.23.37",
+                "packets": "144",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -0.1196,
+                    51.5074
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15133,
+                "autonomous_system_organization": "EDGECAST",
+                "bytes": "48 kB",
+                "city": "London",
+                "country": "United Kingdom",
+                "ip": "93.184.220.29",
+                "packets": "281",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    10.1049,
+                    56.1491
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "299 kB",
+                "city": "Brabrand",
+                "country": "Denmark",
+                "ip": "194.192.82.92",
+                "packets": "1,168",
+                "radius": 5
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 47292,
+                "autonomous_system_organization": "Sentia Denmark A/S",
+                "bytes": "36 kB",
+                "country": "Denmark",
+                "ip": "109.238.54.244",
+                "packets": "136",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "29 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "95.100.155.75",
+                "packets": "245",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "346 kB",
+                "country": "United States",
+                "ip": "143.204.245.73",
+                "packets": "289",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "188 bytes",
+                "country": "United States",
+                "ip": "216.239.35.8",
+                "packets": "2",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "142.250.147.189",
+                "packets": "10,119",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "10 MB",
+                "country": "United States",
+                "ip": "216.58.213.206",
+                "packets": "20,007",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "3 GB",
+                "country": "United States",
+                "ip": "74.125.250.69",
+                "packets": "4,787,224",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "6 MB",
+                "country": "United States",
+                "ip": "64.233.163.127",
+                "packets": "15,126",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "5 MB",
+                "country": "United States",
+                "ip": "142.250.181.193",
+                "packets": "3,997",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "24 kB",
+                "country": "United States",
+                "ip": "172.217.19.81",
+                "packets": "64",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "17 kB",
+                "country": "United States",
+                "ip": "142.250.34.2",
+                "packets": "30",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "23 kB",
+                "country": "United States",
+                "ip": "172.217.19.80",
+                "packets": "51",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 54113,
+                "autonomous_system_organization": "FASTLY",
+                "bytes": "829 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "199.232.42.208",
+                "packets": "575",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "3 MB",
+                "country": "United States",
+                "ip": "23.201.48.201",
+                "packets": "2,017",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "7 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "2.16.63.66",
+                "packets": "26",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 32934,
+                "autonomous_system_organization": "FACEBOOK",
+                "bytes": "85 kB",
+                "country": "United States",
+                "ip": "69.171.250.13",
+                "packets": "130",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 32934,
+                "autonomous_system_organization": "FACEBOOK",
+                "bytes": "39 kB",
+                "country": "United States",
+                "ip": "69.171.250.35",
+                "packets": "80",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 32934,
+                "autonomous_system_organization": "FACEBOOK",
+                "bytes": "145 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "157.240.200.14",
+                "packets": "138",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    11.7549,
+                    55.2252
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 44869,
+                "autonomous_system_organization": "FIBIA P/S",
+                "bytes": "94 kB",
+                "city": "Næstved",
+                "country": "Denmark",
+                "ip": "5.103.46.101",
+                "packets": "77",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 198614,
+                "autonomous_system_organization": "HWJ Invest 2016 ApS",
+                "bytes": "296 kB",
+                "country": "Denmark",
+                "ip": "87.238.248.185",
+                "packets": "179",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "41 kB",
+                "country": "Denmark",
+                "ip": "89.188.72.52",
+                "packets": "60",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    9.9372,
+                    56.0367
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "777 kB",
+                "city": "Skanderborg",
+                "country": "Denmark",
+                "ip": "94.143.8.105",
+                "packets": "354",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "512 kB",
+                "country": "United States",
+                "ip": "216.58.213.225",
+                "packets": "433",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "142 kB",
+                "country": "Denmark",
+                "ip": "94.231.103.164",
+                "packets": "86",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "bytes": "225 kB",
+                "country": "United States",
+                "ip": "65.9.47.142",
+                "packets": "195",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "122 kB",
+                "country": "United States",
+                "ip": "143.204.245.28",
+                "packets": "128",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "9 kB",
+                "country": "United States",
+                "ip": "13.33.141.60",
+                "packets": "50",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "3 kB",
+                "country": "United States",
+                "ip": "143.204.237.91",
+                "packets": "24",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "33 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "80.63.11.71",
+                "packets": "48",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "20 kB",
+                "country": "United States",
+                "ip": "35.190.80.1",
+                "packets": "94",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.4186,
+                    55.649
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "32 MB",
+                "city": "Brøndby",
+                "country": "Denmark",
+                "ip": "195.249.23.142",
+                "packets": "22,465",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "7 MB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "83.94.121.204",
+                "packets": "6,423",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "7 MB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "83.94.121.211",
+                "packets": "5,554",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "2 MB",
+                "country": "Denmark",
+                "ip": "185.21.40.233",
+                "packets": "1,239",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16625,
+                "autonomous_system_organization": "AKAMAI-AS",
+                "bytes": "255 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "104.121.236.114",
+                "packets": "233",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "68 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "34.250.57.36",
+                "packets": "199",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    9.9372,
+                    56.0367
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "49 kB",
+                "city": "Skanderborg",
+                "country": "Denmark",
+                "ip": "94.143.8.108",
+                "packets": "45",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "537 kB",
+                "country": "Denmark",
+                "ip": "185.221.38.40",
+                "packets": "279",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "bytes": "165 kB",
+                "country": "United States",
+                "ip": "65.9.47.13",
+                "packets": "137",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 47527,
+                "autonomous_system_organization": "DLX A/S",
+                "bytes": "48 kB",
+                "country": "Denmark",
+                "ip": "91.223.235.50",
+                "packets": "51",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "689 kB",
+                "country": "United States",
+                "ip": "216.58.213.228",
+                "packets": "1,023",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "70 kB",
+                "country": "Denmark",
+                "ip": "185.21.41.202",
+                "packets": "57",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "22 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "95.100.155.83",
+                "packets": "126",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    24.9344,
+                    60.1797
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 24940,
+                "autonomous_system_organization": "Hetzner Online GmbH",
+                "bytes": "163 kB",
+                "city": "Helsinki",
+                "country": "Finland",
+                "ip": "95.217.85.245",
+                "packets": "93",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "68 kB",
+                "country": "Denmark",
+                "ip": "185.134.29.23",
+                "packets": "58",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "71 kB",
+                "country": "United States",
+                "ip": "143.204.245.34",
+                "packets": "79",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "11 kB",
+                "country": "United States",
+                "ip": "13.32.69.75",
+                "packets": "41",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "bytes": "66 kB",
+                "country": "United States",
+                "ip": "54.192.98.194",
+                "packets": "88",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    8.6842,
+                    50.1187
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "11 kB",
+                "city": "Frankfurt am Main",
+                "country": "Germany",
+                "ip": "3.127.174.70",
+                "packets": "39",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "46 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "79.125.76.33",
+                "packets": "74",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "6 kB",
+                "country": "United States",
+                "ip": "143.204.237.128",
+                "packets": "46",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "95 kB",
+                "country": "United States",
+                "ip": "143.204.245.77",
+                "packets": "89",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "25 kB",
+                "country": "Denmark",
+                "ip": "193.8.38.33",
+                "packets": "28",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "26 kB",
+                "country": "Denmark",
+                "ip": "94.231.103.138",
+                "packets": "42",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "bytes": "103 kB",
+                "country": "United States",
+                "ip": "91.198.174.208",
+                "packets": "93",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "32 kB",
+                "country": "Denmark",
+                "ip": "93.191.156.70",
+                "packets": "41",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "149 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "54.228.142.63",
+                "packets": "367",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "7 kB",
+                "country": "United States",
+                "ip": "142.250.138.188",
+                "packets": "23",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "4 kB",
+                "country": "United States",
+                "ip": "74.125.250.129",
+                "packets": "50",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "704 MB",
+                "country": "United States",
+                "ip": "74.125.250.68",
+                "packets": "1,292,875",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "7 kB",
+                "country": "United States",
+                "ip": "108.177.14.127",
+                "packets": "86",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "7 kB",
+                "country": "United States",
+                "ip": "173.194.198.188",
+                "packets": "20",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "12 kB",
+                "country": "United States",
+                "ip": "142.250.181.203",
+                "packets": "44",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "26 kB",
+                "country": "United States",
+                "ip": "142.250.147.188",
+                "packets": "98",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    4.8975,
+                    52.3759
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "233 kB",
+                "city": "Amsterdam",
+                "country": "The Netherlands",
+                "ip": "20.190.160.5",
+                "packets": "165",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "6 kB",
+                "country": "United States",
+                "ip": "13.107.246.19",
+                "packets": "19",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "142.250.74.67",
+                "packets": "3,034",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "47 kB",
+                "country": "United States",
+                "ip": "142.250.74.100",
+                "packets": "106",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "20 kB",
+                "country": "United States",
+                "ip": "142.250.74.109",
+                "packets": "57",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "12 kB",
+                "country": "United States",
+                "ip": "173.194.220.188",
+                "packets": "56",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "142.250.74.14",
+                "packets": "4,873",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "21 kB",
+                "country": "United States",
+                "ip": "216.58.207.209",
+                "packets": "74",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "16 MB",
+                "country": "United States",
+                "ip": "142.250.74.46",
+                "packets": "36,707",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "181 kB",
+                "country": "United States",
+                "ip": "172.217.21.174",
+                "packets": "358",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "52 kB",
+                "country": "United States",
+                "ip": "142.250.74.11",
+                "packets": "153",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "683 kB",
+                "country": "United States",
+                "ip": "142.250.74.138",
+                "packets": "4,539",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "370 kB",
+                "country": "United States",
+                "ip": "142.250.74.42",
+                "packets": "1,300",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "142.250.74.99",
+                "packets": "1,575",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -112.2491,
+                    33.491
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 396982,
+                "autonomous_system_organization": "GOOGLE-CLOUD-PLATFORM",
+                "bytes": "37 kB",
+                "city": "Phoenix",
+                "country": "United States",
+                "ip": "34.104.35.123",
+                "packets": "56",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "9 MB",
+                "country": "United States",
+                "ip": "216.58.207.234",
+                "packets": "6,001",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "3 MB",
+                "country": "United States",
+                "ip": "142.250.74.142",
+                "packets": "9,556",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "112 kB",
+                "country": "United States",
+                "ip": "74.125.131.188",
+                "packets": "1,030",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "3 MB",
+                "country": "United States",
+                "ip": "142.250.74.35",
+                "packets": "4,445",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "132 kB",
+                "country": "United States",
+                "ip": "142.250.74.36",
+                "packets": "278",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "33 kB",
+                "country": "United States",
+                "ip": "64.233.165.188",
+                "packets": "104",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "142.250.74.141",
+                "packets": "1,166",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    4.8975,
+                    52.3759
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "79 kB",
+                "city": "Amsterdam",
+                "country": "The Netherlands",
+                "ip": "20.190.160.9",
+                "packets": "68",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "11 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "40.126.31.140",
+                "packets": "24",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "224 kB",
+                "country": "United States",
+                "ip": "13.107.213.44",
+                "packets": "175",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "12 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "40.126.31.9",
+                "packets": "24",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "17 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "95.100.154.177",
+                "packets": "68",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "12 kB",
+                "country": "United States",
+                "ip": "216.58.207.195",
+                "packets": "41",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "401 kB",
+                "country": "United States",
+                "ip": "142.250.74.10",
+                "packets": "1,306",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "142.250.74.110",
+                "packets": "6,106",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "27 kB",
+                "country": "United States",
+                "ip": "142.250.74.75",
+                "packets": "70",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "682 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "52.142.124.215",
+                "packets": "743",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "1 MB",
+                "country": "United States",
+                "ip": "142.250.74.74",
+                "packets": "4,557",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "405 kB",
+                "country": "United States",
+                "ip": "216.58.211.10",
+                "packets": "3,316",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "805 kB",
+                "country": "United States",
+                "ip": "216.58.207.206",
+                "packets": "1,673",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "96 kB",
+                "country": "United States",
+                "ip": "142.250.74.131",
+                "packets": "209",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 47292,
+                "autonomous_system_organization": "Sentia Denmark A/S",
+                "bytes": "119 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "77.66.27.239",
+                "packets": "382",
+                "radius": 5
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "100 MB",
+                "country": "United States",
+                "ip": "142.250.74.33",
+                "packets": "85,319",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16625,
+                "autonomous_system_organization": "AKAMAI-AS",
+                "bytes": "13 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "23.78.47.84",
+                "packets": "142",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "774 kB",
+                "country": "United States",
+                "ip": "142.250.74.106",
+                "packets": "5,186",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "188 bytes",
+                "country": "United States",
+                "ip": "216.239.35.12",
+                "packets": "2",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "324 kB",
+                "country": "United States",
+                "ip": "216.58.207.238",
+                "packets": "662",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "475 kB",
+                "country": "United States",
+                "ip": "142.250.74.129",
+                "packets": "675",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "649 kB",
+                "country": "United States",
+                "ip": "142.250.74.78",
+                "packets": "1,605",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "843 kB",
+                "country": "United States",
+                "ip": "216.58.211.14",
+                "packets": "2,874",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "3 MB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "52.214.190.196",
+                "packets": "1,622",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "316 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "20.190.159.133",
+                "packets": "191",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    4.8975,
+                    52.3759
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "15 kB",
+                "city": "Amsterdam",
+                "country": "The Netherlands",
+                "ip": "20.190.160.133",
+                "packets": "26",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "9 kB",
+                "country": "United States",
+                "ip": "142.250.74.2",
+                "packets": "22",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "287 kB",
+                "country": "United States",
+                "ip": "143.204.238.63",
+                "packets": "259",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "22 kB",
+                "country": "United States",
+                "ip": "104.81.36.243",
+                "packets": "43",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 51468,
+                "autonomous_system_organization": "One.com A/S",
+                "bytes": "126 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "46.30.215.231",
+                "packets": "111",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 51468,
+                "autonomous_system_organization": "One.com A/S",
+                "bytes": "23 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "46.30.215.111",
+                "packets": "45",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 51468,
+                "autonomous_system_organization": "One.com A/S",
+                "bytes": "29 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "77.111.240.174",
+                "packets": "51",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.4186,
+                    55.649
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "53 MB",
+                "city": "Brøndby",
+                "country": "Denmark",
+                "ip": "195.249.23.145",
+                "packets": "36,368",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "17 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "194.182.232.77",
+                "packets": "26",
+                "radius": 100
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "12 kB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "83.94.121.206",
+                "packets": "20",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.4186,
+                    55.649
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "9 kB",
+                "city": "Brøndby",
+                "country": "Denmark",
+                "ip": "195.249.23.206",
+                "packets": "19",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.4186,
+                    55.649
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "26 kB",
+                "city": "Brøndby",
+                "country": "Denmark",
+                "ip": "195.249.20.207",
+                "packets": "32",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "572 kB",
+                "country": "United States",
+                "ip": "172.217.21.170",
+                "packets": "5,890",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "93 kB",
+                "country": "United States",
+                "ip": "13.33.124.69",
+                "packets": "100",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -118.244,
+                    34.0544
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 54113,
+                "autonomous_system_organization": "FASTLY",
+                "bytes": "393 kB",
+                "country": "United States",
+                "ip": "185.199.110.133",
+                "packets": "290",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "11 kB",
+                "country": "United States",
+                "ip": "173.194.73.188",
+                "packets": "28",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "75 kB",
+                "country": "United States",
+                "ip": "216.58.207.202",
+                "packets": "214",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "142.250.74.65",
+                "packets": "2,105",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 20940,
+                "autonomous_system_organization": "Akamai International B.V.",
+                "bytes": "4 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "2.23.172.203",
+                "packets": "31",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "100 kB",
+                "country": "United States",
+                "ip": "172.217.21.177",
+                "packets": "224",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "9 kB",
+                "country": "United States",
+                "ip": "142.250.74.17",
+                "packets": "33",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "707 kB",
+                "country": "United States",
+                "ip": "172.217.21.163",
+                "packets": "877",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "75 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "34.255.202.38",
+                "packets": "191",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "62 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "20.82.223.47",
+                "packets": "125",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "46 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "52.142.125.222",
+                "packets": "115",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "223 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "40.126.31.138",
+                "packets": "158",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "9 kB",
+                "country": "United States",
+                "ip": "142.250.74.72",
+                "packets": "17",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "101 kB",
+                "country": "United States",
+                "ip": "142.250.74.49",
+                "packets": "245",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.0564,
+                    55.7123
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 48854,
+                "autonomous_system_organization": "team.blue Denmark A/S",
+                "bytes": "3 MB",
+                "country": "Denmark",
+                "ip": "185.21.40.65",
+                "packets": "2,880",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16625,
+                "autonomous_system_organization": "AKAMAI-AS",
+                "bytes": "34 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "104.121.237.159",
+                "packets": "55",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -122.3993,
+                    37.7642
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 54113,
+                "autonomous_system_organization": "FASTLY",
+                "bytes": "25 kB",
+                "city": "San Francisco",
+                "country": "United States",
+                "ip": "151.101.194.83",
+                "packets": "79",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3656,
+                    55.7327
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16625,
+                "autonomous_system_organization": "AKAMAI-AS",
+                "bytes": "11 kB",
+                "city": "Ballerup Municipality",
+                "country": "Denmark",
+                "ip": "2.17.2.68",
+                "packets": "36",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "223 kB",
+                "country": "United States",
+                "ip": "172.217.21.182",
+                "packets": "315",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -122.3993,
+                    37.7642
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 54113,
+                "autonomous_system_organization": "FASTLY",
+                "bytes": "39 kB",
+                "city": "San Francisco",
+                "country": "United States",
+                "ip": "151.101.130.83",
+                "packets": "81",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "137 kB",
+                "country": "United States",
+                "ip": "142.250.74.54",
+                "packets": "178",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.3,
+                    55.5804
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 47292,
+                "autonomous_system_organization": "Sentia Denmark A/S",
+                "bytes": "394 kB",
+                "city": "Greve",
+                "country": "Denmark",
+                "ip": "77.66.121.201",
+                "packets": "355",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -117.1743,
+                    33.6637
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 30148,
+                "autonomous_system_organization": "SUCURI-SEC",
+                "bytes": "7 kB",
+                "city": "Menifee",
+                "country": "United States",
+                "ip": "192.124.249.24",
+                "packets": "19",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "25 kB",
+                "country": "United States",
+                "ip": "216.58.207.225",
+                "packets": "64",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "8 MB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "83.94.121.210",
+                "packets": "6,980",
+                "radius": 10
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "101 kB",
+                "country": "United States",
+                "ip": "142.250.74.118",
+                "packets": "134",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    12.5892,
+                    55.6802
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 3292,
+                "autonomous_system_organization": "TDC Holding A/S",
+                "bytes": "9 MB",
+                "city": "Copenhagen",
+                "country": "Denmark",
+                "ip": "194.182.232.79",
+                "packets": "7,808",
+                "radius": 100
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "102 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "63.35.239.179",
+                "packets": "300",
+                "radius": 200
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "503 kB",
+                "country": "United States",
+                "ip": "143.204.238.6",
+                "packets": "448",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "2 MB",
+                "country": "United States",
+                "ip": "108.156.253.126",
+                "packets": "1,230",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "104 kB",
+                "country": "United States",
+                "ip": "18.66.242.61",
+                "packets": "178",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "23 MB",
+                "country": "United States",
+                "ip": "18.66.242.173",
+                "packets": "13,795",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "12 kB",
+                "country": "United States",
+                "ip": "13.33.124.10",
+                "packets": "51",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "12 kB",
+                "country": "United States",
+                "ip": "13.33.124.41",
+                "packets": "45",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -6.2591,
+                    53.3379
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 8075,
+                "autonomous_system_organization": "MICROSOFT-CORP-MSN-AS-BLOCK",
+                "bytes": "15 kB",
+                "city": "Dublin",
+                "country": "Ireland",
+                "ip": "20.190.159.135",
+                "packets": "25",
+                "radius": 20
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 16509,
+                "autonomous_system_organization": "AMAZON-02",
+                "bytes": "99 kB",
+                "country": "United States",
+                "ip": "143.204.238.89",
+                "packets": "109",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "19 kB",
+                "country": "United States",
+                "ip": "142.250.74.43",
+                "packets": "48",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "4 kB",
+                "country": "United States",
+                "ip": "142.250.74.3",
+                "packets": "25",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "7 kB",
+                "country": "United States",
+                "ip": "8.8.8.8",
+                "packets": "25",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "7 kB",
+                "country": "United States",
+                "ip": "8.8.4.4",
+                "packets": "21",
+                "radius": 1000
+            },
+            "type": "Feature"
+        },
+        {
+            "geometry": {
+                "coordinates": [
+                    -97.822,
+                    37.751
+                ],
+                "type": "Point"
+            },
+            "properties": {
+                "autonomous_system_number": 15169,
+                "autonomous_system_organization": "GOOGLE",
+                "bytes": "10 kB",
+                "country": "United States",
+                "ip": "173.194.221.188",
+                "packets": "23",
+                "radius": 1000
+            },
+            "type": "Feature"
+        }
+    ],
+    "type": "FeatureCollection"
+}
+</script>
