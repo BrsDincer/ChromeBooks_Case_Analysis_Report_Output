@@ -23,6 +23,10 @@ This repository provides a detailed analysis of **cross-border data transfers** 
 
 5. **Encryption and Privacy**: While traffic is often encrypted (e.g., **TLS**, **QUIC**), this raises issues about the **lack of transparency** in what data is being transferred and how it is being handled.
 
+[View Endpoint Map IPv4 Raw](endpoint_map_ipv4.html)
+
+[View Endpoint Map UDP Raw](endpoint_map_udp.html)
+
 ## Tools Used
 
 - **Wireshark / Tshark**: For packet capture and analysis.
@@ -48,6 +52,3 @@ This repository provides a detailed analysis of **cross-border data transfers** 
 - **Scripts**: Example scripts used for traffic analysis with **Tshark** and **Wireshark**.
 - **Report**: The full report documenting the findings and legal implications.
 
-## License
-
-This work is licensed under the MIT License.
